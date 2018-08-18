@@ -114,7 +114,7 @@
 #include <sys/types.h>  // struct stat
 #include <sys/stat.h>   // stat 
 #include <stdbool.h>
-
+#include <pthread.h>
 
 //***************************************************************
 // local includes 
@@ -444,6 +444,11 @@ hpcrun_open_log_file(void)
   return ret;
 }
 
+static void trace_file_cleanup_on_exit(void * arg){
+  int thread = (int)(arg);
+  TMSG(TRACE, "trace_file_cleanup_on_exit releasing the files_lock %d", thread);
+  spinlock_unlock(&files_lock);
+}
 
 // Returns: file descriptor for trace file.
 int
@@ -453,12 +458,14 @@ hpcrun_open_trace_file(int thread)
 
   TMSG(TRACE, "Opening trace file for %d", thread);
   spinlock_lock(&files_lock);
+  pthread_cleanup_push(trace_file_cleanup_on_exit, (void*) (thread));
   TMSG(TRACE, "Calling files init for %d", thread);
   hpcrun_files_init();
   TMSG(TRACE, "About to open file for %d", thread);
   ret = hpcrun_open_file(0, thread, HPCRUN_TraceFnmSfx, FILES_EARLY);
   TMSG(TRACE, "Back from open file %d, ret code = %d", thread, ret);
   spinlock_unlock(&files_lock);
+  pthread_cleanup_pop(0);
   TMSG(TRACE, "Unlocked file lock for %d", thread);
 
   return ret;
