@@ -100,6 +100,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdint.h>
 
 //---------------------------------------------------------------------
 // macros
@@ -584,6 +587,134 @@ uw_recipe_map_init(void)
     uw_recipe_map_poison(0, UINTPTR_MAX, uw);
 }
 
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+#define PERF_MAP_FILE_PREFIX "/tmp/perf-"
+#define PERF_MAP_FILE_SUFFIX ".map"
+#define PERF_MAP_FILE_ELF_PREFIX "/tmp/sicstus_jit_"
+#define PERF_MAP_FILE_ELF_SUFFIX ".elf"
+static char perf_file[PATH_MAX];
+static char perf_dir[PATH_MAX];
+static char perf_pid[100];
+
+bool decode_start_end_from_file_name(char * filename, void **start, void **end){
+  int len = strlen(filename);
+  //char * p = strrstr(filename, PERF_MAP_FILE_ELF_SUFFIX);
+  if (0 != strcmp(PERF_MAP_FILE_ELF_SUFFIX, filename+len-strlen(PERF_MAP_FILE_ELF_SUFFIX)))
+    return false;
+  // get the start and end
+  char * endptr = 0;
+  uint64_t ustart = strtoull(filename, &endptr, 16);
+  if (ustart == 0)
+    return false;
+  if (filename + len - 4 < endptr)
+    return false;
+  uint64_t uend = strtoull(endptr+2, 0, 16);
+  if (uend == 0)
+    return false;
+  *start = (void*) ustart;
+  *end = (void*) uend;
+  return true;
+}
+      #define _GNU_SOURCE
+       #include <dirent.h>     /* Defines DT_* constants */
+       #include <fcntl.h>
+       #include <stdio.h>
+       #include <unistd.h>
+       #include <stdlib.h>
+       #include <sys/stat.h>
+       #include <sys/syscall.h>
+
+           struct linux_dirent {
+               unsigned long  d_ino;     /* Inode number */
+               unsigned long  d_off;     /* Offset to next linux_dirent */
+               unsigned short d_reclen;  /* Length of this linux_dirent */
+               char           d_name[];  /* Filename (null-terminated) */
+                                 /* length is actually (d_reclen - 2 -
+                                    offsetof(struct linux_dirent, d_name)) */
+               /*
+               char           pad;       // Zero padding byte
+               char           d_type;    // File type (only since Linux
+                                         // 2.6.4); offset is (d_reclen - 1)
+               */
+           };
+
+#define BUF_SIZE (1024)
+ #define handle_error(msg) \
+               do { perror(msg); exit(EXIT_FAILURE); } while (0)
+
+bool 
+get_jited_enclosing_addr(void *ip, void **start, void **end, load_module_t **lm){
+  uint64_t mypid = (uint64_t) getpid();
+  sprintf(perf_dir, "%s%lu",  PERF_MAP_FILE_ELF_PREFIX, mypid);
+
+  int fd = open(perf_dir, O_RDONLY | O_DIRECTORY);
+  if (fd != -1)
+  {
+          bool found = false;
+	  for ( ; ; ) {
+		  char buf[BUF_SIZE];
+		  int nread = syscall(SYS_getdents, fd, buf, BUF_SIZE);
+		  if (nread == -1)
+			  handle_error("getdents");
+
+		  if (nread == 0)
+			  break;
+
+		  for (int bpos = 0; bpos < nread;) {
+			  struct linux_dirent * d = (struct linux_dirent *) (buf + bpos);
+			  bpos += d->d_reclen;
+			  // if ends with .elf
+			  void *foundStart;
+			  void *foundEnd;
+			  if(decode_start_end_from_file_name(d->d_name, &foundStart, &foundEnd)) {
+                                  load_module_t * llm = hpcrun_loadmap_findByAddr(foundStart, foundEnd); 
+				  // create a DSO if new.
+				  if(NULL == llm) {
+				  	dso_info_t * dso = hpcrun_dso_make(d->d_name, NULL, NULL, foundStart, foundEnd, 0);
+				  	if (dso)
+						llm = hpcrun_loadmap_map(dso);
+				  }	
+				  if ( (llm) && (foundStart <= ip) && (ip <foundEnd)) {
+                        		*start = foundStart;
+					*end = foundEnd;
+					*lm = llm;
+					found = true;
+			          }
+			  }
+		  }
+	  }
+	  close (fd);
+	  return found;
+    }
+  else
+    perror ("Couldn't open the directory");
+
+  return false;
+}
+
+#if 0
+bool 
+get_jited_enclosing_addr(void *ip, void **start, void **end, load_module_t **lm){
+  uint64_t mypid = (uint64_t) getpid();
+  sprintf(perf_file, "%s%lu%s",  PERF_MAP_FILE_PREFIX, mypid, PERF_MAP_FILE_SUFFIX);
+  FILE * fp  = fopen(perf_file, "r");
+  char dummy_func[100];
+  while(EOF != fscanf(fp,"%p %p %s\n", start, end, dummy_func)) {
+    if((*start < ip) && (ip > (*start + (int)(*end)))) {
+      *lm = hpcrun_loadmap_findById(0);
+      fclose(fp);
+      return true;
+    }
+  } 
+  fclose(fp);
+  return false;
+    
+}
+#endif
 
 /*
  *
@@ -613,7 +744,13 @@ uw_recipe_map_lookup(void *addr, unwinder_t uw, unwindr_info_t *unwr_info)
   if (!ilm_btui) {
 	load_module_t *lm;
 	void *fcn_start, *fcn_end;
-	if (!fnbounds_enclosing_addr(addr, &fcn_start, &fcn_end, &lm)) {
+        bool fnb_ret = fnbounds_enclosing_addr(addr, &fcn_start, &fcn_end, &lm);
+        if (!fnb_ret) {
+           // Try JITed code
+           fnb_ret = get_jited_enclosing_addr(addr, &fcn_start, &fcn_end, &lm);
+        }
+
+	if (!fnb_ret) {
 	  TMSG(UW_RECIPE_MAP, "BAD fnbounds_enclosing_addr failed: addr %p", addr);
 	  return false;
 	}

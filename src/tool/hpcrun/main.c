@@ -1048,6 +1048,7 @@ monitor_init_thread(int tid, void* data)
 		{
 		  if (atoi(tok) == tid) {
 		    hpcrun_thread_suppress_sample = true;
+		    return 0;
 		  }
 		});
 

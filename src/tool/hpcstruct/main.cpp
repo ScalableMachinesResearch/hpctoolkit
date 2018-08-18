@@ -116,10 +116,11 @@ hpctoolkit_demangler_init(const char *demangler_library_filename, const char *de
 }
 
 //****************************** Main Program *******************************
-
+volatile int DBG = 1;
 int
 main(int argc, char* argv[])
 {
+while(DBG);
   try {
     return realmain(argc, argv);
   }
